@@ -6458,16 +6458,21 @@ class GPUModelRunner(
         """
         block_sizes = []
         max_num_blocks = []
+        is_mamba_group = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
+            is_mamba = isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
+            is_mamba_group.append(is_mamba)
             block_size = kv_cache_group.kv_cache_spec.block_size
             block_sizes.append(block_size)
+            # Mamba/GDN groups are not sharded by DCP — use cp=1
+            cp = 1 if is_mamba else get_total_cp_world_size()
             max_num_blocks_per_req = cdiv(
-                max_model_len, block_size * get_total_cp_world_size()
+                max_model_len, block_size * cp
             )
-            if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
+            if is_mamba:
                 max_num_blocks_per_req = (
                     max_num_blocks_per_req
                     if self.cache_config.enable_prefix_caching
@@ -6500,6 +6505,7 @@ class GPUModelRunner(
                 logitsprocs=self.input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
+                is_mamba_group=is_mamba_group,
             )
 
         assert self._init_block_sizes == block_sizes, (
