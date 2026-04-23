@@ -70,14 +70,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
         from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
 
-        self.pynccl_comm: PyNcclCommunicator | None = None
-        if self.world_size > 1:
-            self.pynccl_comm = PyNcclCommunicator(
-                group=self.cpu_group if tcp_store_group is None else tcp_store_group,
-                device=self.device,
-            )
-            if is_symmetric_memory_enabled():
-                register_nccl_symmetric_ops(self.pynccl_comm)
+        # Lazy-initialize pynccl_comm on first access.  Groups that never
+        # touch pynccl operations (e.g. DCP/PCP whose collectives go through
+        # torch.distributed) will never trigger the creation, avoiding the
+        # NCCL communicator setup cost and a potential hang during subgroup
+        # initialization.
+        self._pynccl_comm: PyNcclCommunicator | None = None
+        self._pynccl_initialized = False
+        self._pynccl_init_group = (
+            self.cpu_group if tcp_store_group is None else tcp_store_group
+        )
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
@@ -177,6 +179,28 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 scope="global",
             )
 
+    @property
+    def pynccl_comm(self):
+        """Lazy-initialized PyNcclCommunicator.
+
+        Created on first access so that groups which never use pynccl
+        (e.g. DCP/PCP) skip the NCCL communicator setup entirely.
+        """
+        if not self._pynccl_initialized:
+            self._pynccl_initialized = True
+            if self.world_size > 1:
+                from vllm.distributed.device_communicators.pynccl import (
+                    PyNcclCommunicator,
+                )
+
+                self._pynccl_comm = PyNcclCommunicator(
+                    group=self._pynccl_init_group,
+                    device=self.device,
+                )
+                if is_symmetric_memory_enabled():
+                    register_nccl_symmetric_ops(self._pynccl_comm)
+        return self._pynccl_comm
+
     def all_reduce(self, input_):
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
@@ -239,7 +263,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
-        assert pynccl_comm is not None
+        if pynccl_comm is None:
+            return super().reduce_scatter(input_, dim)
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
@@ -266,7 +291,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ):
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
-        assert pynccl_comm is not None
+        if pynccl_comm is None:
+            return super().reduce_scatterv(input_, dim, sizes)
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
@@ -337,9 +363,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
-        if self.pynccl_comm is not None:
-            self.pynccl_comm.destroy()
-            self.pynccl_comm = None
+        if self._pynccl_comm is not None:
+            self._pynccl_comm.destroy()
+            self._pynccl_comm = None
+        self._pynccl_initialized = True  # prevent re-creation after destroy
         if self.ca_comm is not None:
             self.ca_comm = None
         if self.fi_ar_comm is not None:

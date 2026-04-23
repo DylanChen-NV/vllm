@@ -1480,6 +1480,59 @@ def init_distributed_environment(
             _INNER_DP_WORLD = _WORLD
 
 
+def _maybe_disable_nccl_p2p_for_dcp(tp_group: GroupCoordinator) -> None:
+    """Disable NCCL P2P when DCP subgroups may land on PCIe-only GPU pairs.
+
+    DCP splits the TP group into smaller subgroups.  NCCL communicators for
+    these subgroups may attempt P2P transport which can hang on GPU pairs
+    connected only via PCIe (no NVLink).  When the TP GPUs are not fully
+    NVLink-connected, we set NCCL_P2P_DISABLE=1 so that NCCL falls back to
+    shared-memory transport.
+
+    This is a no-op if the env var is already set or if all TP GPUs have
+    NVLink interconnect.
+    """
+    import os
+
+    if os.environ.get("NCCL_P2P_DISABLE"):
+        return
+
+    from vllm.platforms import current_platform
+    if not current_platform.is_cuda_alike():
+        return
+
+    # Gather physical device ids across TP ranks (same approach as
+    # custom_all_reduce.py).
+    device = tp_group.device
+    cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
+    if cuda_visible_devices:
+        device_ids = list(map(int, cuda_visible_devices.split(",")))
+    else:
+        device_ids = list(range(current_platform.device_count()))
+
+    physical_device_id = device_ids[device.index]
+    local_tensor = torch.tensor(
+        [physical_device_id], dtype=torch.int, device="cpu"
+    )
+    gather_list = [
+        torch.tensor([0], dtype=torch.int, device="cpu")
+        for _ in range(tp_group.world_size)
+    ]
+    torch.distributed.all_gather(
+        gather_list, local_tensor, group=tp_group.cpu_group
+    )
+    physical_device_ids = [t.item() for t in gather_list]
+
+    if not current_platform.is_fully_connected(physical_device_ids):
+        os.environ["NCCL_P2P_DISABLE"] = "1"
+        logger.warning(
+            "NCCL P2P disabled: DCP subgroups detected on GPUs without "
+            "full NVLink connectivity (physical devices %s). "
+            "NCCL will use shared-memory transport instead.",
+            physical_device_ids,
+        )
+
+
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
@@ -1587,6 +1640,13 @@ def initialize_model_parallel(
     # dcp_size must not exceed tp_size, because the world size does not
     # change by DCP, it simply reuses the GPUs of TP group, and split one
     # TP group into tp_size//dcp_size DCP groups.
+
+    # On systems where not all TP GPUs are connected via NVLink, DCP
+    # subgroup NCCL communicators can hang during P2P setup.  Detect this
+    # and disable NCCL P2P automatically so that NCCL falls back to SHM.
+    if decode_context_model_parallel_size > 1:
+        _maybe_disable_nccl_p2p_for_dcp(_TP)
+
     group_ranks = all_ranks.reshape(-1, decode_context_model_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
     if enable_elastic_ep:
@@ -1594,11 +1654,14 @@ def initialize_model_parallel(
             -1, decode_context_model_parallel_size
         ).unbind(0)
         group_ranks = [x.tolist() for x in group_ranks]
+    # DCP groups only perform all_gather/reduce_scatter during attention;
+    # they never call broadcast_object, so mq_broadcaster is not needed
+    # (and creating it would trigger gloo collectives that hang on subgroups).
     _DCP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
         backend,
-        use_message_queue_broadcaster=True,
+        use_message_queue_broadcaster=False,
         group_name="dcp",
     )
 
