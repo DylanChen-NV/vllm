@@ -26,6 +26,8 @@ class BlockTable:
         device: torch.device,
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
+        override_dcp_world_size: int | None = None,
+        override_dcp_rank: int | None = None,
     ):
         """
         Args:
@@ -90,13 +92,17 @@ class BlockTable:
             # PCP might not be initialized in testing
             self.pcp_world_size = 1
             self.pcp_rank = 0
-        try:
-            self.dcp_world_size = get_dcp_group().world_size
-            self.dcp_rank = get_dcp_group().rank_in_group
-        except AssertionError:
-            # DCP might not be initialized in testing
-            self.dcp_world_size = 1
-            self.dcp_rank = 0
+        if override_dcp_world_size is not None:
+            self.dcp_world_size = override_dcp_world_size
+            self.dcp_rank = override_dcp_rank if override_dcp_rank is not None else 0
+        else:
+            try:
+                self.dcp_world_size = get_dcp_group().world_size
+                self.dcp_rank = get_dcp_group().rank_in_group
+            except AssertionError:
+                # DCP might not be initialized in testing
+                self.dcp_world_size = 1
+                self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
 
     def append_row(
@@ -234,6 +240,7 @@ class MultiGroupBlockTable:
         kernel_block_sizes: list[int],
         max_num_blocks: list[int] | None = None,
         cp_kv_cache_interleave_size: int = 1,
+        is_mamba_group: list[bool] | None = None,
     ) -> None:
         if len(kernel_block_sizes) != len(block_sizes):
             raise ValueError(
@@ -245,10 +252,14 @@ class MultiGroupBlockTable:
             # (max_model_len//dcp_world_size) tokens in kvcache,
             # so the block_size which used for calc max_num_blocks_per_req
             # must be multiplied by dcp_world_size.
+            # Mamba/GDN groups are not sharded by DCP, so use cp=1 for them.
             total_cp_world_size = get_total_cp_world_size()
             max_num_blocks = [
-                cdiv(max_model_len, block_size * total_cp_world_size)
-                for block_size in block_sizes
+                cdiv(max_model_len, block_size * (
+                    1 if (is_mamba_group and is_mamba_group[i])
+                    else total_cp_world_size
+                ))
+                for i, block_size in enumerate(block_sizes)
             ]
 
         if len(max_num_blocks) != len(block_sizes):
@@ -257,21 +268,25 @@ class MultiGroupBlockTable:
                 f"must match block_sizes length ({len(block_sizes)})"
             )
 
-        self.block_tables = [
-            BlockTable(
-                block_size,
-                max_num_reqs,
-                max_num_blocks_per_req,
-                max_num_batched_tokens,
-                pin_memory,
-                device,
-                kernel_block_size,
-                cp_kv_cache_interleave_size,
+        self.block_tables = []
+        for i, (block_size, kernel_block_size, max_num_blocks_per_req) in (
+            enumerate(zip(block_sizes, kernel_block_sizes, max_num_blocks))
+        ):
+            is_mamba = is_mamba_group[i] if is_mamba_group else False
+            self.block_tables.append(
+                BlockTable(
+                    block_size,
+                    max_num_reqs,
+                    max_num_blocks_per_req,
+                    max_num_batched_tokens,
+                    pin_memory,
+                    device,
+                    kernel_block_size,
+                    cp_kv_cache_interleave_size,
+                    override_dcp_world_size=1 if is_mamba else None,
+                    override_dcp_rank=0 if is_mamba else None,
+                )
             )
-            for block_size, kernel_block_size, max_num_blocks_per_req in zip(
-                block_sizes, kernel_block_sizes, max_num_blocks
-            )
-        ]
 
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):

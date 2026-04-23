@@ -52,7 +52,8 @@ class SingleTypeKVCacheManager(ABC):
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
         if dcp_world_size * pcp_world_size > 1:
-            self.block_size *= dcp_world_size * pcp_world_size
+            if not isinstance(kv_cache_spec, MambaSpec):
+                self.block_size *= dcp_world_size * pcp_world_size
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
         self.enable_caching = enable_caching

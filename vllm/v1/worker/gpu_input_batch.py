@@ -95,6 +95,7 @@ class InputBatch:
         is_spec_decode: bool = False,
         is_pooling_model: bool = False,
         cp_kv_cache_interleave_size: int = 1,
+        is_mamba_group: list[bool] | None = None,
     ):
         self.is_pooling_model = is_pooling_model
         self.is_spec_decode = is_spec_decode
@@ -160,6 +161,7 @@ class InputBatch:
             kernel_block_sizes=kernel_block_sizes,
             max_num_blocks=max_num_blocks_per_req,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            is_mamba_group=is_mamba_group,
         )
 
         # Sampling-related.
