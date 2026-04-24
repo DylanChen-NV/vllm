@@ -345,6 +345,19 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 self.attention_config.flash_attn_max_num_splits_for_cuda_graph
             )
 
+        # Pre-allocate a persistent buffer for DCP context KV lens so that
+        # the tensor address remains stable across full CUDA graph replays.
+        # Without this, build() allocates a fresh tensor each call, and the
+        # graph replays read from the stale capture-time address.
+        if self.use_full_cuda_graph and self.dcp_world_size > 1:
+            max_batch_size = max(
+                vllm_config.scheduler_config.max_num_seqs,
+                self.max_cudagraph_size or 0,
+            )
+            self._dcp_context_kv_lens_buf = torch.zeros(
+                max_batch_size, dtype=torch.int32, device=self.device,
+            )
+
         # Sliding window size to be used with the AOT scheduler will be
         # populated on first build() call.
         self.aot_sliding_window: tuple[int, int] | None = None
@@ -450,6 +463,13 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 self.dcp_rank,
                 self.cp_kv_cache_interleave_size,
             )
+            # Copy into persistent buffer so the tensor address stays stable
+            # across full CUDA graph replays.
+            if self.use_full_cuda_graph:
+                self._dcp_context_kv_lens_buf[:num_reqs].copy_(
+                    dcp_context_kv_lens)
+                self._dcp_context_kv_lens_buf[num_reqs:].fill_(0)
+                dcp_context_kv_lens = self._dcp_context_kv_lens_buf[:num_reqs]
             # After DCP distribution, the maximum number of tokens for any rank is
             # ceil(L / (N * I)) * I, where L is max_seq_len, N is dcp_world_size,
             # and I is cp_kv_cache_interleave_size.
