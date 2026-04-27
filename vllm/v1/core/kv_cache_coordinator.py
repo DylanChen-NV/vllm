@@ -399,6 +399,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # different KV cache groups have different block sizes, the actual block size
         # can be a multiple of hash_block_size.
         self.hash_block_size = hash_block_size
+        self.dcp_world_size = dcp_world_size
+        self.pcp_world_size = pcp_world_size
         assert all(
             g.kv_cache_spec.block_size % hash_block_size == 0
             for g in kv_cache_config.kv_cache_groups
@@ -517,6 +519,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         kv_cache_spec=spec,
                         use_eagle=self.use_eagle,
                         alignment_tokens=self.lcm_block_size,
+                        dcp_world_size=(
+                            self.dcp_world_size if is_full_attn else 1),
+                        pcp_world_size=(
+                            self.pcp_world_size if is_full_attn else 1),
                     )
                     curr_hit_length = len(hit_blocks[0]) * spec.block_size
                     for group_id, blocks in zip(group_ids, hit_blocks):
