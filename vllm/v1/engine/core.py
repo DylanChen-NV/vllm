@@ -140,6 +140,17 @@ class EngineCore:
             * vllm_config.parallel_config.prefill_context_parallel_size
         )
 
+        # For hybrid models (multiple KV cache groups), hash_block_size must
+        # divide all group block sizes without DCP/PCP scaling, because the
+        # HybridKVCacheCoordinator checks spec.block_size % hash_block_size.
+        kv_groups = kv_cache_config.kv_cache_groups
+        if len(kv_groups) > 1:
+            from math import gcd
+            hash_block_size = gcd(
+                *(g.kv_cache_spec.block_size for g in kv_groups))
+        else:
+            hash_block_size = scheduler_block_size
+
         self.scheduler: SchedulerInterface = Scheduler(
             vllm_config=vllm_config,
             kv_cache_config=kv_cache_config,
@@ -147,6 +158,7 @@ class EngineCore:
             include_finished_set=include_finished_set,
             log_stats=self.log_stats,
             block_size=scheduler_block_size,
+            hash_block_size=hash_block_size,
         )
         self.use_spec_decode = vllm_config.speculative_config is not None
         if self.scheduler.connector is not None:  # type: ignore
@@ -204,7 +216,7 @@ class EngineCore:
             init_none_hash(caching_hash_fn)
 
             self.request_block_hasher = get_request_block_hasher(
-                scheduler_block_size, caching_hash_fn
+                hash_block_size, caching_hash_fn
             )
 
         self.step_fn = (
