@@ -263,7 +263,6 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
         """Reset FlexKV's internal cache (all tiers).
 
         Returns:
-            True on success. The scheduler treats only a literal ``False`` as
-            failure, so a no-op worker-role call returning ``None`` is fine.
+            True on success.
         """
         return self._flexkv_connector.reset_cache()
