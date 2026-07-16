@@ -2441,6 +2441,15 @@ class Scheduler(SchedulerInterface):
             # persistent batch in the model runner.
             self.prev_step_scheduled_req_ids.clear()
 
+        # Reset the connector before the block pool. A connector such as FlexKV
+        # holds GPU blocks under delayed free for in-flight transfers; its reset
+        # returns those blocks so the block-pool reset below sees them freed.
+        # Running it after would leave the blocks in use and make the block-pool
+        # reset report False even when the connector reset itself succeeded.
+        connector_successful = True
+        if reset_connector:
+            connector_successful = self.reset_connector_cache()
+
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
         if reset_running_requests and not reset_successful:
             raise RuntimeError(
@@ -2450,10 +2459,7 @@ class Scheduler(SchedulerInterface):
                 "which is not supported yet."
             )
 
-        if reset_connector:
-            reset_successful = self.reset_connector_cache() and reset_successful
-
-        return reset_successful
+        return reset_successful and connector_successful
 
     def reset_connector_cache(self) -> bool:
         if self.connector is None:
@@ -2470,6 +2476,25 @@ class Scheduler(SchedulerInterface):
 
         if self.connector.reset_cache() is False:
             return False
+
+        # Free requests the connector kept alive under delayed free. A connector
+        # such as FlexKV returns True from request_finished() to hold a request's
+        # GPU blocks until an in-flight save completes; those blocks are only
+        # returned when a later engine step observes the transfer via
+        # finished_sending. After generate() returns the engine stops stepping,
+        # so a save that lands after the final model step never gets observed and
+        # its request lingers in self.requests with blocks still held. The
+        # connector reset above has abandoned those transfers (its cache is
+        # cleared, so the stale KV can never be matched), so free every finished
+        # request still lingering here; otherwise the block-pool reset below sees
+        # them as in use and reports failure.
+        lingering = [
+            req
+            for req_id, req in self.requests.items()
+            if req.is_finished()
+        ]
+        for request in lingering:
+            self._free_blocks(request)
 
         if self.log_stats:
             assert self.connector_prefix_cache_stats is not None
