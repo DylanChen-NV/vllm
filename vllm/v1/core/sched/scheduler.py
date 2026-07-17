@@ -2104,7 +2104,10 @@ class Scheduler(SchedulerInterface):
                 request.record_event(EngineCoreEventType.QUEUED)
 
     def finish_requests(
-        self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
+        self,
+        request_ids: str | Iterable[str] | None,
+        finished_status: RequestStatus,
+        offload_aborted_kv: bool = False,
     ) -> list[tuple[str, int]]:
         """Handles the finish signal from outside the scheduler.
 
@@ -2160,6 +2163,9 @@ class Scheduler(SchedulerInterface):
                 )
                 self.finished_recving_kv_req_ids.discard(request.request_id)
                 self.failed_recving_kv_req_ids.discard(request.request_id)
+
+            if finished_status == RequestStatus.FINISHED_ABORTED:
+                request.offload_kv_on_finish = offload_aborted_kv
 
             request.status = finished_status
             self._free_request(request, delay_free_blocks=delay_free_blocks)
@@ -2283,6 +2289,12 @@ class Scheduler(SchedulerInterface):
             self.has_unfinished_requests()
             or self.has_finished_requests()
             or (self.connector is not None and self.connector.has_pending_push_work())
+        )
+
+    def supports_abort_kv_offload(self) -> bool:
+        return bool(
+            self.connector is not None
+            and self.connector.supports_abort_kv_offload()
         )
 
     def reset_prefix_cache(
