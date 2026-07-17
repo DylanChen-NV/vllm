@@ -188,6 +188,7 @@ class EngineClient(ABC):
         mode: "PauseMode" = "abort",
         wait_for_inflight_requests: bool = False,
         clear_cache: bool = True,
+        offload_aborted_kv: bool | None = None,
     ) -> None:
         """Pause new generation/encoding requests.
 
@@ -201,6 +202,8 @@ class EngineClient(ABC):
             wait_for_inflight_requests: DEPRECATED. Use ``mode="wait"`` instead.
             clear_cache: DEPRECATED. Whether to clear KV and prefix caches
                 after draining.
+            offload_aborted_kv: Whether a capable KV connector should save
+                aborted-request KV. None uses the connector capability default.
         """
         ...
 
