@@ -1,0 +1,162 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+@@
+-from typing import Any
++import json
++import os
++import time
++from typing import Any
+@@
+-from vllm.v1.request import Request
++from vllm.v1.request import Request, RequestStatus
+@@
+ logger = init_logger(__name__)
++
++
++def _abort_kv_event(phase: str, **fields: Any) -> None:
++    if os.getenv("VLLM_MOONCAKE_ABORT_KV_TRACE", "0") != "1":
++        return
++    payload = {"phase": phase, "wall_ns": time.time_ns(), **fields}
++    logger.info("MOONCAKE_ABORT_KV_EVENT %s", json.dumps(payload, sort_keys=True))
+@@
+         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
+         self._unfinished_request_ids: set[str] = set()
++        self._finished_save_metas: dict[str, ReqMeta] = {}
+@@
+         """Check for external KV cache hit."""
+         # Look up against the full prefill range, not just the prompt.
+         token_len = request.num_tokens // self._block_size * self._block_size
+         if token_len < self._block_size:
+             return 0, False
++        if os.getenv("VLLM_MOONCAKE_FORCE_MISS", "0") == "1":
++            _abort_kv_event(
++                "LOOKUP_FORCED_MISS",
++                request_id=request.request_id,
++                token_len=token_len,
++            )
++            return 0, False
+ 
+         num_external_hit_tokens = self.client.lookup(token_len, request.block_hashes)
++        _abort_kv_event(
++            "LOOKUP",
++            request_id=request.request_id,
++            token_len=token_len,
++            hit_tokens=num_external_hit_tokens,
++        )
+@@
+         """Build connector metadata for this scheduler step."""
+         force_skip_save = self.kv_role == "kv_consumer"
++        preempted_ids = scheduler_output.preempted_req_ids or set()
++        meta = MooncakeStoreConnectorMetadata(
++            self._unfinished_request_ids,
++            preempted_ids,
++        )
+ 
+         for finished_req_id in scheduler_output.finished_req_ids:
++            final_save_meta = self._finished_save_metas.pop(finished_req_id, None)
++            if final_save_meta is not None:
++                meta.add_request(final_save_meta)
+             self.load_specs.pop(finished_req_id, None)
+@@
+-        preempted_ids = scheduler_output.preempted_req_ids or set()
+         self._preempted_req_ids.update(preempted_ids)
+@@
+-        meta = MooncakeStoreConnectorMetadata(
+-            self._unfinished_request_ids,
+-            preempted_ids,
+-        )
+-
+         # Handle new requests
+@@
+         """Determine whether to delay freeing blocks for async save."""
+         if self.kv_role == "kv_consumer":
+             return False, None
++        if (
++            request.status == RequestStatus.FINISHED_ABORTED
++            and os.getenv("VLLM_MOONCAKE_ABORT_KV_REUSE", "0") == "1"
++        ):
++            saved_tokens = (
++                request.num_computed_tokens // self._block_size * self._block_size
++            )
++            if saved_tokens <= 0 or not request.block_hashes:
++                _abort_kv_event(
++                    "FINAL_SAVE_SKIPPED",
++                    request_id=request.request_id,
++                    num_computed_tokens=request.num_computed_tokens,
++                    reason="no_complete_block",
++                )
++                return False, None
++            final_tracker = RequestTracker(
++                req_id=request.request_id,
++                token_len=saved_tokens,
++                allocated_block_ids=tuple(group.copy() for group in block_ids),
++                num_saved_tokens=0,
++                token_ids=list(request.all_token_ids[:saved_tokens]),
++                prefill_end_tokens=saved_tokens,
++            )
++            final_save_meta = ReqMeta.from_request_tracker(
++                final_tracker,
++                self._block_size,
++                block_hashes=request.block_hashes,
++                is_last_chunk=True,
++            )
++            if final_save_meta is None:
++                return False, None
++            self._finished_save_metas[request.request_id] = final_save_meta
++            total_blocks = sum(len(group) for group in block_ids)
++            _abort_kv_event(
++                "FINAL_SAVE_QUEUED",
++                request_id=request.request_id,
++                num_computed_tokens=request.num_computed_tokens,
++                saved_tokens=saved_tokens,
++                total_blocks=total_blocks,
++            )
++            return total_blocks > 0, None
+         tracker = self._request_trackers.get(request.request_id)
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@
+-    def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None | Future:
++    def sleep(
++        self,
++        level: int = 1,
++        mode: PauseMode = "abort",
++        reset_connector: bool = True,
++    ) -> None | Future:
+@@
+-        pause_future = self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)
++        pause_future = self.pause_scheduler(
++            mode=mode,
++            clear_cache=clear_prefix_cache,
++            reset_connector=reset_connector,
++        )
+@@
+-    def pause_scheduler(
+-        self, mode: PauseMode = "abort", clear_cache: bool = True
++    def pause_scheduler(
++        self,
++        mode: PauseMode = "abort",
++        clear_cache: bool = True,
++        reset_connector: bool = True,
+@@
+-        if clear_cache:
+-            self._reset_caches()
++        if clear_cache:
++            self._reset_caches(reset_connector=reset_connector)
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@
+-    async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
++    async def sleep(
++        self,
++        level: int = 1,
++        mode: PauseMode = "abort",
++        reset_connector: bool = True,
++    ) -> None:
+         if level >= 1:
+             await self.renderer.clear_mm_cache_async()
+-        await self.engine_core.sleep_async(level, mode)
++        await self.engine_core.sleep_async(level, mode, reset_connector)
