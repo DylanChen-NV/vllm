@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -199,6 +200,8 @@ class FlexKVConnectorV1(KVConnectorBase_V1):
             num_external_tokens is the number of additional tokens that
             can be loaded from the external KV cache.
         """
+        if os.getenv("VLLM_FLEXKV_FORCE_MISS", "0") == "1":
+            return 0, False
         return self._flexkv_connector.get_num_new_matched_tokens(
             request, num_computed_tokens
         )
